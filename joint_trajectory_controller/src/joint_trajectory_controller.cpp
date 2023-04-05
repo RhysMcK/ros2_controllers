@@ -116,6 +116,12 @@ controller_interface::return_type JointTrajectoryController::update(
     return controller_interface::return_type::OK;
   }
 
+  // Set default "zero" or "halt" command for hardware write().
+  // Sets position commands to current position and velocity, acceleration and effort commands to zero.
+  // These command values will be later over-written if trajectory checks are successful.
+  // This effectively clears the previous update loop command.
+  halt_command();
+
   auto compute_error_for_joint = [&](
                                    JointTrajectoryPoint & error, int index,
                                    const JointTrajectoryPoint & current,
@@ -193,7 +199,13 @@ controller_interface::return_type JointTrajectoryController::update(
       (*traj_point_active_ptr_)
         ->sample(time, interpolation_method_, state_desired_, start_segment_itr, end_segment_itr);
 
-    if (valid_point)
+    if (!valid_point)
+    {
+      // TODO(peterdavidfagan) temporary solution to keep the initial position
+      // before the first trajectory goal arrives
+      set_hold_position();
+    }
+    else
     {
       bool tolerance_violated_while_moving = false;
       bool outside_goal_tolerance = false;
@@ -351,7 +363,8 @@ controller_interface::return_type JointTrajectoryController::update(
       else if (tolerance_violated_while_moving)
       {
         set_hold_position();
-        RCLCPP_ERROR(get_node()->get_logger(), "Holding position due to state tolerance violation");
+        RCLCPP_ERROR_ONCE(
+          get_node()->get_logger(), "Holding position due to state tolerance violation");
       }
     }
   }
@@ -836,25 +849,7 @@ controller_interface::CallbackReturn JointTrajectoryController::on_activate(
 controller_interface::CallbackReturn JointTrajectoryController::on_deactivate(
   const rclcpp_lifecycle::State &)
 {
-  // TODO(anyone): How to halt when using effort commands?
-  for (size_t index = 0; index < dof_; ++index)
-  {
-    if (has_position_command_interface_)
-    {
-      joint_command_interface_[0][index].get().set_value(
-        joint_command_interface_[0][index].get().get_value());
-    }
-
-    if (has_velocity_command_interface_)
-    {
-      joint_command_interface_[1][index].get().set_value(0.0);
-    }
-
-    if (has_effort_command_interface_)
-    {
-      joint_command_interface_[3][index].get().set_value(0.0);
-    }
-  }
+  halt_command();
 
   for (size_t index = 0; index < allowed_interface_types_.size(); ++index)
   {
@@ -1287,10 +1282,19 @@ void JointTrajectoryController::preempt_active_goal()
 
 void JointTrajectoryController::set_hold_position()
 {
-  trajectory_msgs::msg::JointTrajectory empty_msg;
-  empty_msg.header.stamp = rclcpp::Time(0);
+  trajectory_msgs::msg::JointTrajectory msg;
+  msg.header.stamp = rclcpp::Time(0);
+  msg.joint_names = params_.joints;
+  trajectory_msgs::msg::JointTrajectoryPoint point;
+  for (const auto & joint_position : state_current_.positions)
+  {
+    point.velocities.push_back(0);
+    point.accelerations.push_back(0);
+    point.positions.push_back(joint_position);
+  }
+  msg.points.push_back(point);
 
-  auto traj_msg = std::make_shared<trajectory_msgs::msg::JointTrajectory>(empty_msg);
+  auto traj_msg = std::make_shared<trajectory_msgs::msg::JointTrajectory>(msg);
   add_new_trajectory_msg(traj_msg);
 }
 
@@ -1312,6 +1316,36 @@ void JointTrajectoryController::resize_joint_trajectory_point(
   if (has_acceleration_state_interface_)
   {
     point.accelerations.resize(size, 0.0);
+  }
+}
+
+void JointTrajectoryController::halt_command()
+{
+  // Set all command interfaces to there corresponding halt state.
+  // For position intefaces this is the current position, for all others it's zero.
+  // TODO(anyone): Check if this makes sense for effort interface joints.
+  for (size_t index = 0; index < dof_; ++index)
+  {
+    if (has_position_command_interface_)
+    {
+      joint_command_interface_[0][index].get().set_value(
+        joint_command_interface_[0][index].get().get_value());
+    }
+
+    if (has_velocity_command_interface_)
+    {
+      joint_command_interface_[1][index].get().set_value(0.0);
+    }
+
+    if (has_acceleration_command_interface_)
+    {
+      joint_command_interface_[2][index].get().set_value(0.0);
+    }
+
+    if (has_effort_command_interface_)
+    {
+      joint_command_interface_[3][index].get().set_value(0.0);
+    }
   }
 }
 
